@@ -1,0 +1,22 @@
+# Secrets — never commit
+credentials.sh
+
+# Environment-specific config — copy from the sample_* files and fill in locally
+core/constants/MANAGER_MAP.yaml
+core/constants/SOFTWARE_MAP.yaml
+hostnames.txt
+
+# Agent / assistant customization — not shared with the customer
+AGENTS.md
+.github/agents/
+docs/copilot-resume.md
+
+# Editor
+.vscode/
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

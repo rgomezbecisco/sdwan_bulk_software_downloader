@@ -1,0 +1,7 @@
+catalystwan==0.41.2
+Jinja2==3.1.6
+pyats[full]
+Pygments==2.19.2
+PyYAML==6.0.3
+rich>=13.7.0
+urllib3==2.6.3

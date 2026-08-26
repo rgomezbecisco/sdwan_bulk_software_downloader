@@ -1,0 +1,29 @@
+# Copy this file to MANAGER_MAP.yaml and fill in real values:
+#   cp constants/sample_MANAGER_MAP.yaml constants/MANAGER_MAP.yaml
+#
+# Map of every vManage cluster node this tool may need to reach, keyed by the
+# system IP that vManage's device inventory reports as "connectedVManages".
+#
+# Fill in one entry per vManage node in the environment's cluster.
+#   hostname            - vManage node hostname (used for display/logging only)
+#   manager_system_ip   - vManage node's system-ip, as shown in device inventory
+#   manager_public_ip   - IP/hostname this tool can reach the node on for SSH
+#   https_link          - optional, for reference only
+#   ssh_link            - optional, for reference only ({{USERNAME}} placeholder allowed)
+#
+# NOTE: manager_public_ip must point at the SAME environment your credentials
+# target. A mismatch will send SSH logins to the wrong vManage and can lock out
+# the account.
+
+manager_map:
+  - hostname: vmanage-01
+    manager_system_ip: 10.0.0.1
+    manager_public_ip: vmanage-01.example.com
+    https_link: https://vmanage-01.example.com
+    ssh_link: ssh://{{USERNAME}}@vmanage-01.example.com
+
+  - hostname: vmanage-02
+    manager_system_ip: 10.0.0.2
+    manager_public_ip: vmanage-02.example.com
+    https_link: https://vmanage-02.example.com
+    ssh_link: ssh://{{USERNAME}}@vmanage-02.example.com

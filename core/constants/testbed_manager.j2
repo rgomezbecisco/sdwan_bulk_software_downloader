@@ -1,0 +1,24 @@
+devices:
+  {{ manager_hostname }}:
+    connections:
+      ssh:
+        ip: {{ manager_ip }}
+        port: {{ manager_port }}
+        protocol: ssh
+        settings:
+          GRACEFUL_DISCONNECT_WAIT_SEC: 5
+          EXEC_TIMEOUT: 30
+    type: viptela
+    os: manager
+    credentials:
+      default:
+        username: {{ manager_username }}
+        password: {{ manager_password }}
+    init_config_commands: []
+    init_exec_commands: []
+testbed:
+  credentials:
+    default:
+      username: {{ manager_username }}
+      password: {{ manager_password }}
+  name: 'sdwan_testbed'

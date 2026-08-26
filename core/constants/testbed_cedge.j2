@@ -1,0 +1,51 @@
+devices:
+  {{ manager_hostname }}:
+    connections:
+      ssh:
+        ip: {{ manager_ip }}
+        port: {{ manager_port }}
+        protocol: ssh
+    type: viptela
+    os: manager
+    credentials:
+      default:
+        username: {{ manager_username }}
+        password: {{ manager_password }}
+  {{ edge_hostname }}:
+    connections:
+      ssh:
+        ip: {{ edge_system_ip }}
+        port: {{ edge_port }}
+        protocol: ssh
+        proxy: {{ manager_hostname}}
+        command: request execute ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p {{ edge_port }} -l admin {{ edge_system_ip }}
+        arguments:
+          connection_timeout: 60
+        settings:
+          PROMPT_RECOVERY: false
+          POST_DISCONNECT_WAIT_SEC: 0
+          GRACEFUL_DISCONNECT_WAIT_SEC: 0
+    type: router
+    os: iosxe
+    credentials:
+      default:
+        username: admin
+        password: {{ edge_admin_password }}
+      edge_reauth:
+        username: admin
+        password: {{ edge_admin_password }}
+testbed:
+  credentials:
+    default:
+      password: {{ edge_admin_password }}
+      username: admin
+    sdwanedge:
+      password: {{ edge_admin_password }}
+      username: admin
+  name: 'sdwan_testbed'
+  servers:
+    {{ manager_hostname }}:
+      credentials:
+        default:
+          username: {{ manager_username }}
+          password: {{ manager_password }}

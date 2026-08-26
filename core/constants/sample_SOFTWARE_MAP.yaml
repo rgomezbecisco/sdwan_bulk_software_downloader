@@ -1,0 +1,32 @@
+# Copy this file to SOFTWARE_MAP.yaml and fill in real values:
+#   cp constants/sample_SOFTWARE_MAP.yaml constants/SOFTWARE_MAP.yaml
+#
+# Per-platform software image map.
+#
+# Keyed by the raw `device-model` value returned by vManage `dataservice/device`
+# (note the `vedge-` prefix is present even on IOS XE cEdge platforms).
+# Populate `filename` with the exact image name staged in the vManage software
+# repository, and `bytes` with that image's exact size.
+#
+# `bytes: 0` means "read the size from the repository at run time". Prefer a
+# real value — the runtime lookup requires a device-side shell.
+#
+# Devices whose model is not listed here fail fast with "no image mapped"
+# rather than downloading a wrong image.
+#
+# To discover the models in an environment and the images staged in the
+# repository:
+#   GET /dataservice/device                  -> device-model per device
+#   GET /dataservice/device/action/software  -> availableFiles per platformFamily
+
+vedge-C8000V:
+  filename: "c8000v-universalk9.<version>.SPA.bin"
+  bytes: 0
+
+vedge-C8300-1N1S-4T2X:
+  filename: "c8000be-universalk9.<version>.SPA.bin"
+  bytes: 0
+
+vedge-ISR-4431:
+  filename: "isr4400-universalk9.<version>.SPA.bin"
+  bytes: 0

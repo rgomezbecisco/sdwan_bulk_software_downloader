@@ -1,0 +1,9 @@
+# Copy this file to hostnames.txt and list the devices to act on:
+#   cp sample_hostnames.txt hostnames.txt
+#
+# One device hostname per line, exactly as vManage reports it in `host-name`.
+# Blank lines and lines starting with '#' are ignored.
+
+SITE01-EDGE01
+SITE01-EDGE02
+SITE02-EDGE01
