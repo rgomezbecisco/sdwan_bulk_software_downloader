@@ -9,7 +9,6 @@ hostnames.txt
 # Agent / assistant customization — not shared with the customer
 AGENTS.md
 .github/agents/
-docs/copilot-resume.md
 
 # Editor
 .vscode/
