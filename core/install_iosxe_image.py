@@ -8,7 +8,7 @@ from utils.ssh_manager import sshManager
 from find_manager import run_find_manager
 from utils import tprint
 
-def run_install_iosxe_image(target_manager, filename=None, custom_timeout=120, verbose=False, sshclient=None, reuse_session=False):
+def run_install_iosxe_image(target_manager, filename=None, custom_timeout=1200, verbose=False, sshclient=None, reuse_session=False):
 
     print("<< Install IOS XE image - START >>")
 
@@ -19,7 +19,7 @@ def run_install_iosxe_image(target_manager, filename=None, custom_timeout=120, v
         print("<< Install IOS XE image - END >>\n")
         return {"success": False, "output": "no image mapped for device model"}
 
-    install_command = f"request software install-image {filename}"
+    install_command = f"request platform software sdwan software install bootflash:{filename}"
         
     sshclient = sshclient or sshManager(target_manager)
     result = sshclient.send_command_on_edge_cli(

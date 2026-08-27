@@ -26,6 +26,16 @@ os.environ["PYTHONWARNINGS"] = "ignore"
 # Import pyats modules after warning suppression
 from pyats.topology import loader
 
+# Image source on the vManage, and the only directory an SD-WAN edge accepts
+# remote writes into. The staged filename must be the real image name — the
+# edge rejects arbitrary names.
+#
+# MANAGER_IMAGE_DIR is expanded by the vManage shell, so the default resolves to
+# the home of whichever user VMANAGE_USER is — not necessarily /home/admin.
+MANAGER_IMAGE_DIR = os.getenv("MANAGER_IMAGE_DIR", "$HOME")
+EDGE_STAGING_DIR = "/bootflash/vmanage-admin"
+EDGE_STAGING_DIR_CLI = "bootflash:vmanage-admin/"
+
 class sshManager():
 
     def __init__(self, target_manager):
@@ -103,6 +113,10 @@ class sshManager():
         """Run a command in an existing shell and handle interactive confirmations."""
         import re
         prompt_patterns = [r'.*[#>]\s*$']
+        disconnect_patterns = [
+            r'.*closed by remote host.*',
+            r'.*Connection to .* closed.*',
+        ]
         interactive_patterns = [
             r'.*continue connecting \(yes/no(?:/\[fingerprint\])?\)\?.*',
             r'.*\[yes/no\].*',
@@ -115,7 +129,7 @@ class sshManager():
         # Matches a real password prompt at end of received text (not embedded in output)
         _password_prompt_re = re.compile(r'[Pp]assword:\s*$')
 
-        patterns = interactive_patterns + prompt_patterns
+        patterns = interactive_patterns + disconnect_patterns + prompt_patterns
         output_chunks = []
 
         spawn.sendline(command)
@@ -134,6 +148,11 @@ class sshManager():
 
             lowered = text.lower()
             stripped = text.strip()
+
+            # The vManage drops the session under load; fail now rather than
+            # waiting out the remaining timeout for a prompt that never arrives.
+            if "closed by remote host" in lowered or "connection to" in lowered and "closed" in lowered:
+                raise ConnectionError(f"session closed by remote host during: {command}")
 
             # Only send password if the output ends with an actual password prompt
             if password and _password_prompt_re.search(stripped):
@@ -155,17 +174,14 @@ class sshManager():
 
         raise TimeoutError(f"Timed out waiting for command completion: {command}")
 
-    def _open_edge_spawn(self):
-        """Open SSH manager->cEdge jump session and return active spawn at the IOS XE prompt."""
+    def _open_manager_vshell_spawn(self):
+        """Open SSH to the vManage and drop into its vshell (bash). Returns active spawn."""
         from unicon.eal.expect import Spawn
 
         manager_ip = self.credentials.get("ip")
         manager_user = self.credentials.get("user")
         manager_pwd = self.credentials.get("pwd")
         manager_port = self.credentials.get("port")
-        edge_ip = self.credentials.get("edge_system_ip")
-        edge_pwd = self.credentials.get("edge_admin_pwd")
-        edge_port = self.edge_ssh_port
 
         spawn = Spawn(
             f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
@@ -181,6 +197,16 @@ class sshManager():
         spawn.sendline("vshell")
         spawn.expect([r'.*~\$'], timeout=10)
         tprint(f"Entered vshell on {self.credentials.get('hostname')}")
+
+        return spawn
+
+    def _open_edge_spawn(self):
+        """Open SSH manager->cEdge jump session and return active spawn at the IOS XE prompt."""
+        edge_ip = self.credentials.get("edge_system_ip")
+        edge_pwd = self.credentials.get("edge_admin_pwd")
+        edge_port = self.edge_ssh_port
+
+        spawn = self._open_manager_vshell_spawn()
 
         spawn.sendline(
             f"ssh -o StrictHostKeyChecking=no "
@@ -238,19 +264,6 @@ class sshManager():
                 pass
             self._edge_spawn = None
 
-    def _open_edge_vshell_spawn(self):
-        """Extend _open_edge_spawn by entering a bash shell on the edge.
-
-        Viptela-only — IOS XE cEdge has no `vshell`. Pending replacement in the
-        cEdge download engine rework.
-        """
-        spawn = self._open_edge_spawn()
-        spawn.sendline("vshell")
-        # match the full prompt line so match_output includes it; Viptela prompt: hostname:~$
-        spawn.expect([r'.*~?\$\s*$', r'.*~\$'], timeout=10)
-        tprint(f"Entered vshell on {self.credentials.get('edge_hostname')}")
-        return spawn
-
     def _vshell_run(self, spawn, command, marker, timeout=15):
         """Send a command that embeds its result in an echo marker, return matched text."""
         spawn.sendline(command)
@@ -260,25 +273,68 @@ class sshManager():
         spawn.expect([r'.*~?\$\s*$', r'.*\$\s*$'], timeout=5)
         return raw
 
-    def fire_background_wget(self, vmanage_ip, filename):
-        """Launch nohup wget on the edge bash shell and disconnect. Returns PID string or None."""
+    def fire_background_scp(self, filename):
+        """Launch a detached sshpass+scp push from the vManage to the edge. Returns PID or None."""
         import re
-        spawn = self._open_edge_vshell_spawn()
-        # --continue resumes a partial file; keep flags minimal for Viptela wget compatibility
+
+        edge_ip = self.credentials.get("edge_system_ip")
+        edge_pwd = self.credentials.get("edge_admin_pwd")
+
+        spawn = self._open_manager_vshell_spawn()
+
+        # Log beside the image so it lands somewhere this user can write.
+        log_path = f"{MANAGER_IMAGE_DIR}/scp_{edge_ip}.log"
+
+        # Fail early and clearly if the image is not readable by this user.
+        check = self._vshell_run(
+            spawn,
+            f"test -r {MANAGER_IMAGE_DIR}/{filename} && echo IMG:ok || echo IMG:missing",
+            r'IMG:\S+',
+        )
+        if "IMG:ok" not in check:
+            try:
+                spawn.sendline("exit")
+                spawn.close()
+            except Exception:
+                pass
+            raise Exception(
+                f"image not readable at {MANAGER_IMAGE_DIR}/{filename} "
+                f"as user {self.credentials.get('user')}")
+
+        # SSHPASS is passed via the environment so the password never lands in the process list.
+        # scp cannot resume, so a retry always restarts from zero.
         cmd = (
-            f"nohup wget --continue"
-            f" http://{vmanage_ip}:8080/software/package/{filename}"
-            f" -O /home/admin/{filename} >/tmp/wget_dl.log 2>&1 &"
+            f"SSHPASS='{edge_pwd}' nohup sshpass -e scp -P {self.edge_ssh_port}"
+            f" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+            f" {MANAGER_IMAGE_DIR}/{filename}"
+            f" admin@{edge_ip}:{EDGE_STAGING_DIR}/{filename}"
+            f" >{log_path} 2>&1 &"
             f" echo BGPID:$!"
         )
         spawn.sendline(cmd)
-        match = spawn.expect([r'BGPID:\d+', r'BGPID:'], timeout=15)
+        match = spawn.expect(
+            [r'BGPID:\d+', r'Permission denied', r'No such file or directory',
+             r'command not found', r'BGPID:'],
+            timeout=15,
+        )
         raw = self._extract_expect_output(match)
-        # consume prompt
         try:
             spawn.expect([r'.*~?\$\s*$', r'.*\$\s*$'], timeout=5)
         except Exception:
             pass
+
+        try:
+            spawn.sendline("exit")
+            spawn.close()
+        except Exception:
+            pass
+
+        # A failed redirect or missing binary still yields a PID for the dead subshell,
+        # so treat any shell error as a launch failure rather than a running transfer.
+        for marker in ("Permission denied", "No such file or directory", "command not found"):
+            if marker in raw:
+                raise Exception(f"scp launch failed on the vManage shell: {marker} — {raw.strip()[-160:]}")
+
         pid = None
         m = re.search(r'BGPID:(\d+)', raw)
         if m:
@@ -288,132 +344,120 @@ class sshManager():
             m = re.search(r'\[\d+\]\s+(\d+)', raw)
             if m:
                 pid = m.group(1)
-        try:
-            spawn.sendline("exit")
-            spawn.close()
-        except Exception:
-            pass
-        tprint(f"nohup wget fired on {self.credentials.get('edge_hostname')} — PID: {pid}")
+
+        tprint(f"scp push fired to {self.credentials.get('edge_hostname')} — PID: {pid}")
         if pid is None:
             tprint(f"[!] Could not parse PID. Raw output: {repr(raw)}")
+
         return pid
 
-    def get_remote_file_size(self, vmanage_ip, filename):
-        """Return the staged image size in bytes via wget --spider, or None if unavailable."""
-        import re as _re
+    def cleanup_before_transfer(self, filename):
+        """Remove any partial/stale staged image from the edge before a fresh push."""
+        result = self.send_command_on_edge_cli(
+            f"delete /force {EDGE_STAGING_DIR_CLI}{filename}", custom_timeout=60)
+        tprint(f"Cleaned staged image on {self.credentials.get('edge_hostname')}")
+        return result
 
-        spawn = self._open_edge_vshell_spawn()
-        raw = self._vshell_run(
-            spawn,
-            f"echo SPIDER:$(wget --spider"
-            f" http://{vmanage_ip}:8080/software/package/{filename} 2>&1"
-            f" | grep -oE 'Length: [0-9]+' | head -1 | tr -dc '0-9')",
-            r'SPIDER:\d*',
-            timeout=30,
-        )
+    def poll_transfer_progress(self, filename):
+        """Return bytes written so far to the edge staging directory.
 
-        try:
-            spawn.sendline("exit")
-            spawn.close()
-        except Exception:
-            pass
-
-        m = _re.search(r'SPIDER:(\d+)', raw)
-        size = int(m.group(1)) if m else None
-
-        if size:
-            tprint(f"Image '{filename}' is {size} bytes on {vmanage_ip}")
-        else:
-            tprint(f"[!] Could not determine size of '{filename}' on {vmanage_ip}")
-
-        return size
-
-    def cleanup_before_download(self, filename):
-        """Remove stale download file(s) and old wget logs from the edge before a fresh run."""
-        spawn = self._open_edge_vshell_spawn()
-        # remove versioned copies wget creates when target file already exists (.1, .2, …)
-        self._vshell_run(spawn,
-            f"rm -f /home/admin/{filename} /home/admin/{filename}.* 2>/dev/null; echo CLEAN:done",
-            r'CLEAN:done')
-        self._vshell_run(spawn,
-            "rm -f /tmp/wget_dl.log /tmp/wget_dl.log.* 2>/dev/null; echo LOGCLEAN:done",
-            r'LOGCLEAN:done')
-        tprint(f"Cleaned up old download files on {self.credentials.get('edge_hostname')}")
-        try:
-            spawn.sendline("exit")
-            spawn.close()
-        except Exception:
-            pass
-
-    def poll_download_progress(self, filename, expected_bytes):
-        """Check download progress via edge bash shell.
-
-        Returns dict with keys:
-          bytes_downloaded, process_alive, progress_pct, wget_speed, wget_eta, log_tail
+        `ps` is unreliable on the vManage, so liveness is inferred by the caller
+        from byte growth across polls rather than from process state.
         """
-        import re as _re
+        spawn = self._open_edge_spawn()
 
-        spawn = self._open_edge_vshell_spawn()
-
-        # embed result in marker — bypasses match_output capture issues
-        raw_size = self._vshell_run(
-            spawn,
-            f"echo SIZE:$(wc -c < /home/admin/{filename} 2>/dev/null || echo 0)",
-            r'SIZE:\d+',
-        )
-        m = _re.search(r'SIZE:(\d+)', raw_size)
-        bytes_downloaded = int(m.group(1)) if m else 0
-
-        raw_proc = self._vshell_run(
-            spawn,
-            "echo PROC:$(ps 2>/dev/null | grep wget | grep -v grep | wc -l || echo 0)",
-            r'PROC:\S+',
-        )
-        m = _re.search(r'PROC:(\S+)', raw_proc)
-        proc_val = m.group(1) if m else "0"
-        process_alive = proc_val.isdigit() and int(proc_val) > 0
-
-        # extract percentage from last wget progress line in the log
-        raw_pct = self._vshell_run(
-            spawn,
-            "echo PCT:$(grep -oE '[0-9]+%' /tmp/wget_dl.log 2>/dev/null | tail -1 | tr -d '%' || echo NONE)",
-            r'PCT:\S+',
-        )
-        m = _re.search(r'PCT:(\S+)', raw_pct)
-        pct_val = m.group(1) if m else "NONE"
-        progress_pct = float(pct_val) if pct_val.isdigit() else -1.0
-
-        # speed and ETA from the last full progress line
-        raw_log = self._vshell_run(
-            spawn,
-            "echo LOGLINE:$(grep -E '[0-9]+%' /tmp/wget_dl.log 2>/dev/null | tail -1 | tr -s ' ' | cut -d' ' -f7,8 || echo NONE)",
-            r'LOGLINE:\S+',
-        )
-        wget_speed = ""
-        wget_eta   = ""
-        log_tail   = ""
-        m = _re.search(r'LOGLINE:(\S+)\s*(\S*)', raw_log)
-        if m and m.group(1) != "NONE":
-            wget_speed = m.group(1)
-            wget_eta   = m.group(2)
-            log_tail   = f"{pct_val}% @ {wget_speed} ETA {wget_eta}"
-        elif "NO_LOG" in raw_log or pct_val == "NONE":
-            log_tail = "no wget log — wget may not have launched"
+        spawn.sendline(f"dir {EDGE_STAGING_DIR_CLI}{filename}")
+        match = spawn.expect([r'.*#\s*$'], timeout=60)
+        out = self._extract_expect_output(match)
 
         try:
             spawn.sendline("exit")
             spawn.close()
         except Exception:
             pass
+
+        bytes_transferred = 0
+        note = ""
+
+        if "No such file" in out or "%Error" in out:
+            note = "not yet created on the edge"
+        else:
+            for line in out.splitlines():
+                # the "Directory of <path>" header also contains the filename — skip it
+                if filename not in line or line.strip().startswith("Directory of"):
+                    continue
+                # dir entry: <index>  -rw-  <bytes>  <date>  <name>
+                for token in line.split()[1:]:
+                    if token.isdigit():
+                        bytes_transferred = int(token)
+                        break
+                if bytes_transferred:
+                    break
 
         return {
-            "bytes_downloaded": bytes_downloaded,
-            "process_alive":    process_alive,
-            "progress_pct":     progress_pct,
-            "wget_speed":       wget_speed,
-            "wget_eta":         wget_eta,
-            "log_tail":         log_tail,
+            "bytes_transferred": bytes_transferred,
+            "note":              note,
         }
+
+    def stage_image(self, filename, custom_timeout=600, reuse_session=False):
+        """Copy the pushed image from the staging directory to the bootflash root."""
+        result = {"success": False, "output": ""}
+        owns_spawn = False
+
+        try:
+            if reuse_session:
+                spawn = self.open_edge_session()
+            else:
+                spawn = self._open_edge_spawn()
+                owns_spawn = True
+
+            spawn.sendline(
+                f"copy {EDGE_STAGING_DIR_CLI}{filename} bootflash:{filename}")
+
+            out = ""
+            for _ in range(4):
+                match = spawn.expect([
+                    r'.*Destination filename.*\?\s*$',
+                    r'.*over ?write.*\[confirm\].*',
+                    r'.*\[confirm\].*',
+                    r'.*#\s*$',
+                ], timeout=custom_timeout)
+                chunk = self._extract_expect_output(match)
+                out += chunk
+
+                if "Destination filename" in chunk or "confirm" in chunk.lower():
+                    spawn.sendline("")
+                    continue
+                break
+
+            result["output"] = out
+            result["success"] = "bytes copied in" in out
+
+            if owns_spawn:
+                try:
+                    spawn.sendline("exit")
+                    spawn.close()
+                except Exception:
+                    pass
+
+            if result["success"]:
+                tprint(f"Staged image to bootflash: on {self.credentials.get('edge_hostname')}")
+            else:
+                tprint(f"[!] Staging copy did not confirm. Output tail: {repr(out[-200:])}")
+
+        except Exception as e:
+            tprint(f"Staging copy failed: {e}")
+            result["output"] = str(e)
+
+        return result
+
+    def remove_staged_image(self, filename, reuse_session=False):
+        """Delete the staging-directory copy once the install is confirmed."""
+        result = self.send_command_on_edge_cli(
+            f"delete /force {EDGE_STAGING_DIR_CLI}{filename}",
+            custom_timeout=60, reuse_session=reuse_session)
+        tprint(f"Removed staged image on {self.credentials.get('edge_hostname')}")
+        return result
 
     def send_command_on_manager_cli(self, command):
         """Send a command on the manager CLI via pyATS."""
@@ -564,6 +608,9 @@ class sshManager():
                     pass
                 spawn.close()
             
+        except ConnectionError:
+            # let the caller reconnect and retry rather than reporting a command failure
+            raise
         except Exception as e:
             tprint(f"cEdge connection/command failed: {str(e)}")
             result["output"] = str(e)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Root-level wrapper for bulk nohup wget software download to multiple cEdge sites.
+"""Root-level wrapper for bulk software image push + install to multiple cEdge sites.
 
 Usage:
   python tool_bulk_download_software.py --file hostnames.txt

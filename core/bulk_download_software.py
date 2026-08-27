@@ -13,14 +13,18 @@ from rich.table import Table
 
 from find_manager import run_find_manager
 from install_iosxe_image import run_install_iosxe_image
+from utils import console
 from utils.additional_functions import find_software_for_model
 from utils.api_manager import sdwanManager
 from utils.ssh_manager import sshManager
 from verify_iosxe_image import run_verify_iosxe_image
 
 POLL_INTERVAL_DEFAULT = 60   # seconds
-MAX_WORKERS = 20
-MAX_DOWNLOAD_RETRIES = 5     # auto-resume retries before giving up
+MAX_WORKERS = 5
+MAX_DOWNLOAD_RETRIES = 2       # scp cannot resume, so each retry restarts from zero
+STALL_POLLS_BEFORE_RETRY = 3   # consecutive polls with no byte growth
+MAX_SESSION_RETRIES = 3        # attempts for a phase when the vManage drops the session
+SESSION_RETRY_BACKOFF = 20     # seconds to wait before reconnecting
 
 
 class DownloadStatus(str, Enum):
@@ -28,6 +32,7 @@ class DownloadStatus(str, Enum):
     FIRING      = "FIRING"
     DOWNLOADING = "DOWNLOADING"
     COMPLETE    = "COMPLETE"
+    STAGING     = "STAGING"
     VERIFYING   = "VERIFYING"
     INSTALLING  = "INSTALLING"
     CONFIRMING  = "CONFIRMING"
@@ -40,6 +45,7 @@ _STATUS_COLOR = {
     "FIRING":      "yellow",
     "DOWNLOADING": "cyan",
     "COMPLETE":    "blue",
+    "STAGING":     "magenta",
     "VERIFYING":   "magenta",
     "INSTALLING":  "magenta",
     "CONFIRMING":  "blue",
@@ -52,6 +58,7 @@ _STATUS_ICON = {
     "FIRING":      "⚡",
     "DOWNLOADING": "↓",
     "COMPLETE":    "✓",
+    "STAGING":     "⇉",
     "VERIFYING":   "⊙",
     "INSTALLING":  "⚙",
     "CONFIRMING":  "⊛",
@@ -77,10 +84,8 @@ class SiteState:
     _prev_bytes:       int   = field(default=0, repr=False)
     _prev_poll_time:   float = field(default=0.0, repr=False)
     _eta_seconds:      float = field(default=-1.0, repr=False)
-    _stall_polls:      int   = field(default=0, repr=False)   # consecutive polls with 0 bytes
-    _retry_count:      int   = field(default=0, repr=False)   # auto-resume attempts
-    wget_speed:        str   = ""
-    wget_eta:          str   = ""
+    _stall_polls:      int   = field(default=0, repr=False)   # consecutive polls with no growth
+    _retry_count:      int   = field(default=0, repr=False)   # transfer restarts
     _lock:             threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def update(self, **kwargs):
@@ -104,10 +109,6 @@ class SiteState:
     @property
     def eta_str(self) -> str:
         with self._lock:
-            # prefer wget's own ETA; fall back to our calculated value
-            if self.wget_eta:
-                speed = f" @ {self.wget_speed}" if self.wget_speed else ""
-                return f"{self.wget_eta}{speed}"
             if self._eta_seconds <= 0:
                 return "—"
             return str(timedelta(seconds=int(self._eta_seconds)))
@@ -131,6 +132,12 @@ def _resolve_site(state: SiteState):
                          error=f"no image mapped for model '{device_model or 'unknown'}'")
             return
 
+        if software["bytes"] <= 0:
+            state.update(status=DownloadStatus.FAILED, device_model=device_model,
+                         software_filename=software["filename"],
+                         error=f"no size set for '{software['filename']}' in SOFTWARE_MAP.yaml")
+            return
+
         state.update(
             target_manager=target_manager,
             vmanage_ip=target_manager.get("manager_system_ip", ""),
@@ -142,42 +149,14 @@ def _resolve_site(state: SiteState):
         state.update(status=DownloadStatus.FAILED, error=f"resolve: {exc}")
 
 
-def _resolve_image_sizes(states: list["SiteState"], max_workers: int):
-    """Fill expected_bytes for images whose size was left at 0 in SOFTWARE_MAP.yaml."""
-    pending: dict[str, list[SiteState]] = {}
-    for s in states:
-        if s.status != DownloadStatus.FAILED and s.expected_bytes <= 0:
-            pending.setdefault(s.software_filename, []).append(s)
-
-    if not pending:
-        return
-
-    def _lookup(filename: str, sites: list[SiteState]):
-        probe = sites[0]
-        try:
-            size = sshManager(probe.target_manager).get_remote_file_size(
-                probe.vmanage_ip, filename)
-            err = f"'{filename}' not found in vManage software repository"
-        except Exception as exc:
-            size, err = None, f"size lookup failed: {exc}"
-        for s in sites:
-            if size:
-                s.update(expected_bytes=size)
-            else:
-                s.update(status=DownloadStatus.FAILED, error=err)
-
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        list(as_completed({pool.submit(_lookup, f, ss): f for f, ss in pending.items()}))
-
-
 def _fire_site(state: SiteState, cleanup: bool = False):
     state.update(status=DownloadStatus.FIRING)
     try:
         client = sshManager(state.target_manager)
         if cleanup:
-            client.cleanup_before_download(state.software_filename)
-        pid = client.fire_background_wget(state.vmanage_ip, state.software_filename)
-        # Transition regardless of PID — first poll will confirm whether wget is alive
+            client.cleanup_before_transfer(state.software_filename)
+        pid = client.fire_background_scp(state.software_filename)
+        # Transition regardless of PID — first poll will confirm whether bytes are moving
         state.update(status=DownloadStatus.DOWNLOADING,
                      error="" if pid else "PID unknown — will confirm on first poll")
     except Exception as exc:
@@ -187,96 +166,120 @@ def _fire_site(state: SiteState, cleanup: bool = False):
 def _poll_site(state: SiteState):
     try:
         client = sshManager(state.target_manager)
-        poll = client.poll_download_progress(state.software_filename, state.expected_bytes)
+        poll = client.poll_transfer_progress(state.software_filename)
+        bytes_dl = poll["bytes_transferred"]
 
-        bytes_dl      = poll["bytes_downloaded"]
-        process_alive = poll["process_alive"]
-        log_pct       = poll["progress_pct"]    # from wget log; -1 if not yet available
-        log_tail      = poll["log_tail"]
+        pct = round(min(bytes_dl / state.expected_bytes * 100, 100.0), 1) if state.expected_bytes else 0.0
 
-        # prefer wget's own percentage; fall back to bytes ratio only if log unavailable
-        if log_pct >= 0:
-            pct = log_pct
-        elif state.expected_bytes > 0:
-            pct = round(min(bytes_dl / state.expected_bytes * 100, 100.0), 1)
-        else:
-            pct = 0.0
-
-        state.update(wget_speed=poll["wget_speed"], wget_eta=poll["wget_eta"])
         prev_bytes = state._prev_bytes   # capture before record_poll updates it
         state.record_poll(bytes_dl)
-        file_growing = bytes_dl > prev_bytes
+        growing = bytes_dl > prev_bytes
 
-        if log_pct >= 100.0 or (state.expected_bytes > 0 and bytes_dl >= state.expected_bytes):
+        if state.expected_bytes and bytes_dl >= state.expected_bytes:
             state.update(status=DownloadStatus.COMPLETE, progress_pct=100.0,
                          bytes_downloaded=bytes_dl, error="")
-        elif bytes_dl > 0 and not process_alive and not file_growing and log_pct < 99.0:
-            with state._lock:
-                state._retry_count += 1
-                retries = state._retry_count
-            if retries <= MAX_DOWNLOAD_RETRIES:
-                # re-fire with --continue so wget resumes from current byte offset
-                try:
-                    client2 = sshManager(state.target_manager)
-                    client2.fire_background_wget(state.vmanage_ip, state.software_filename)
-                    state.update(status=DownloadStatus.DOWNLOADING,
-                                 error=f"retry {retries}/{MAX_DOWNLOAD_RETRIES} — resuming from {pct:.0f}% | {log_tail}")
-                except Exception as re_exc:
-                    state.update(status=DownloadStatus.FAILED,
-                                 error=f"retry {retries} fire failed: {re_exc}")
-            else:
-                state.update(status=DownloadStatus.FAILED, progress_pct=pct,
-                             bytes_downloaded=bytes_dl,
-                             error=f"gave up after {retries} retries at {pct:.0f}% | {log_tail}")
-        elif bytes_dl == 0 and log_pct < 0:
-            with state._lock:
-                state._stall_polls += 1
-                stall = state._stall_polls
-            if stall >= 2:
-                state.update(status=DownloadStatus.FAILED,
-                             error=f"wget stalled (log: {log_tail or 'no log'})")
-            else:
-                state.update(status=DownloadStatus.DOWNLOADING, progress_pct=0.0,
-                             bytes_downloaded=0, error=log_tail)
-        else:
+            return
+
+        if growing:
             with state._lock:
                 state._stall_polls = 0
             state.update(status=DownloadStatus.DOWNLOADING, progress_pct=pct,
-                         bytes_downloaded=bytes_dl, error=log_tail)
+                         bytes_downloaded=bytes_dl, error="")
+            return
+
+        with state._lock:
+            state._stall_polls += 1
+            stall = state._stall_polls
+
+        if stall < STALL_POLLS_BEFORE_RETRY:
+            state.update(status=DownloadStatus.DOWNLOADING, progress_pct=pct,
+                         bytes_downloaded=bytes_dl,
+                         error=f"no growth {stall}/{STALL_POLLS_BEFORE_RETRY} | {poll['note']}")
+            return
+
+        with state._lock:
+            state._retry_count += 1
+            retries = state._retry_count
+
+        if retries <= MAX_DOWNLOAD_RETRIES:
+            try:
+                client2 = sshManager(state.target_manager)
+                # scp cannot resume — clear the partial file and start over
+                client2.cleanup_before_transfer(state.software_filename)
+                client2.fire_background_scp(state.software_filename)
+                with state._lock:
+                    state._stall_polls = 0
+                    state._prev_bytes = 0
+                state.update(status=DownloadStatus.DOWNLOADING, progress_pct=0.0,
+                             bytes_downloaded=0,
+                             error=f"retry {retries}/{MAX_DOWNLOAD_RETRIES} — restarted from 0")
+            except Exception as re_exc:
+                state.update(status=DownloadStatus.FAILED,
+                             error=f"retry {retries} fire failed: {re_exc}")
+        else:
+            state.update(status=DownloadStatus.FAILED, progress_pct=pct,
+                         bytes_downloaded=bytes_dl,
+                         error=f"stalled at {pct:.0f}% after {MAX_DOWNLOAD_RETRIES} retries")
     except Exception as exc:
         state.update(error=f"poll: {exc}")
 
 
-def _verify_install_site(state: SiteState):
-    import re as _re
+def _verify_install_site(state: SiteState, attempt: int = 1):
+    """Stage, verify, install and confirm over a single reused edge session."""
+    client = None
     try:
+        client = sshManager(state.target_manager)
+
+        state.update(status=DownloadStatus.STAGING)
+        if not client.stage_image(state.software_filename, reuse_session=True).get("success"):
+            state.update(status=DownloadStatus.FAILED,
+                         error="staging copy to bootflash: failed")
+            return
+
         state.update(status=DownloadStatus.VERIFYING)
         if not run_verify_iosxe_image(state.target_manager,
-                                      filename=state.software_filename).get("success"):
+                                      filename=state.software_filename,
+                                      sshclient=client, reuse_session=True).get("success"):
             state.update(status=DownloadStatus.FAILED, error="verify failed")
             return
+
         state.update(status=DownloadStatus.INSTALLING)
         if not run_install_iosxe_image(state.target_manager,
-                                       filename=state.software_filename).get("success"):
+                                       filename=state.software_filename,
+                                       sshclient=client, reuse_session=True).get("success"):
             state.update(status=DownloadStatus.FAILED, error="install failed")
             return
 
         state.update(status=DownloadStatus.CONFIRMING)
-        client = sshManager(state.target_manager)
-        result = client.send_command_on_edge_cli("show sdwan software", custom_timeout=30)
+        result = client.send_command_on_edge_cli("show sdwan software",
+                                                 custom_timeout=60, reuse_session=True)
         output = result.get("output", "")
-        # extract version key from filename: 17.09.05f or 17.12.08
-        m = _re.search(r'universalk9\.(\d+(?:\.\d+)+[a-z]?)', state.software_filename)
-        version_key = m.group(1) if m else ""
+        version_key = _target_version(state.software_filename)
+
         if version_key and version_key in output:
+            client.remove_staged_image(state.software_filename, reuse_session=True)
             state.update(status=DownloadStatus.DONE, error=f"confirmed: {version_key} listed")
         elif not version_key:
             state.update(status=DownloadStatus.DONE, error="confirm skipped: version key not parsed")
         else:
             state.update(status=DownloadStatus.FAILED,
-                         error=f"version {version_key} NOT found in show software")
+                         error=f"version {version_key} NOT found in show sdwan software")
+
+    except ConnectionError as exc:
+        # vManage drops sessions under load — reconnect and restart this phase once
+        if attempt < MAX_SESSION_RETRIES:
+            state.update(error=f"session dropped, retrying ({attempt}/{MAX_SESSION_RETRIES - 1})")
+            if client:
+                client.close_edge_session()
+            time.sleep(SESSION_RETRY_BACKOFF)
+            _verify_install_site(state, attempt=attempt + 1)
+            return
+        state.update(status=DownloadStatus.FAILED, error=f"session dropped: {exc}")
     except Exception as exc:
         state.update(status=DownloadStatus.FAILED, error=f"verify/install: {exc}")
+    finally:
+        if client:
+            client.close_edge_session()
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +293,7 @@ def _bar(pct: float, width: int = 18) -> str:
 
 def _build_table(states: list[SiteState], next_poll_in: int, polling: bool) -> Table:
     table = Table(
-        title=f"IOS XE Bulk Download  —  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        title=f"IOS XE Bulk Image Push  —  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         box=box.ROUNDED,
         expand=True,
     )
@@ -312,8 +315,9 @@ def _build_table(states: list[SiteState], next_poll_in: int, polling: bool) -> T
         if st.status in (DownloadStatus.DOWNLOADING,):
             bar_cell = f"[cyan]{_bar(st.progress_pct)}[/cyan] {st.progress_pct:.1f}%"
             eta_cell = st.eta_str
-        elif st.status in (DownloadStatus.COMPLETE, DownloadStatus.VERIFYING,
-                           DownloadStatus.INSTALLING, DownloadStatus.DONE):
+        elif st.status in (DownloadStatus.COMPLETE, DownloadStatus.STAGING,
+                           DownloadStatus.VERIFYING, DownloadStatus.INSTALLING,
+                           DownloadStatus.CONFIRMING, DownloadStatus.DONE):
             bar_cell = f"[green]{_bar(100.0)}[/green] 100.0%"
             eta_cell = "—"
         elif st.status == DownloadStatus.FAILED and st.progress_pct > 0:
@@ -335,11 +339,12 @@ def _build_table(states: list[SiteState], next_poll_in: int, polling: bool) -> T
 
     parts = [f"[bold]{len(states)} site{'s' if len(states) != 1 else ''}[/bold]"]
     for status, label, color in [
-        (DownloadStatus.DOWNLOADING, "downloading", "cyan"),
-        (DownloadStatus.VERIFYING,   "verifying",   "magenta"),
-        (DownloadStatus.INSTALLING,  "installing",  "magenta"),
-        (DownloadStatus.DONE,        "done",        "green"),
-        (DownloadStatus.FAILED,      "failed",      "red"),
+        (DownloadStatus.DOWNLOADING, "transferring", "cyan"),
+        (DownloadStatus.STAGING,     "staging",      "magenta"),
+        (DownloadStatus.VERIFYING,   "verifying",    "magenta"),
+        (DownloadStatus.INSTALLING,  "installing",   "magenta"),
+        (DownloadStatus.DONE,        "done",         "green"),
+        (DownloadStatus.FAILED,      "failed",       "red"),
     ]:
         if counts[status]:
             parts.append(f"[{color}]{counts[status]} {label}[/{color}]")
@@ -374,20 +379,15 @@ def run_bulk_download(
         return
 
     states = [SiteState(hostname=h) for h in hostnames]
-    console = Console()
 
     # ---- resolve managers -----------------------------------------------
     console.print(f"\n[bold]Resolving managers for {len(states)} sites…[/bold]")
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         list(as_completed({pool.submit(_resolve_site, s): s for s in states}))
 
-    # ---- resolve image sizes --------------------------------------------
-    console.print("[bold]Resolving image sizes from the vManage software repository…[/bold]")
-    _resolve_image_sizes(states, max_workers)
-
-    # ---- fire downloads --------------------------------------------------
+    # ---- fire transfers --------------------------------------------------
     fireable = [s for s in states if s.status != DownloadStatus.FAILED]
-    console.print(f"[bold]{'Cleaning up + firing' if cleanup else 'Firing'} downloads on {len(fireable)} sites…[/bold]")
+    console.print(f"[bold]{'Cleaning up + pushing' if cleanup else 'Pushing'} images to {len(fireable)} sites…[/bold]")
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         list(as_completed({pool.submit(_fire_site, s, cleanup): s for s in fireable}))
 
@@ -704,7 +704,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Bulk nohup wget download + verify + install across multiple cEdge sites."
+        description="Bulk scp push + stage + verify + install across multiple cEdge sites."
     )
     parser.add_argument("--file",     "-f",
                         help="Text file with one hostname per line")
@@ -716,7 +716,7 @@ if __name__ == "__main__":
                         help="With a hostname: walk each SSH hop for that device and dump raw "
                              "output. Bare, with --file: read-only fleet pre-flight over the API")
     parser.add_argument("--cleanup", "-c", action="store_true",
-                        help="Remove existing image file(s) and wget logs before firing downloads")
+                        help="Delete any partial/stale staged image on the edge before pushing")
     args = parser.parse_args()
 
     if args.diagnose:

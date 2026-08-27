@@ -16,7 +16,6 @@ def argument_parser():
     parser.add_argument("--showsupport", "-ss", action="store_true", help="Display supported templates")
     parser.add_argument("--sitetype", "-t", type=str, default="STORE_ST6", help="Site type suffix for variable files (e.g., STORE_ST6, STORE_ST5, etc)")
     parser.add_argument("--mhub", action="store_true", help="Append MHUB-specific verification show commands")
-    parser.add_argument("--wget", action="store_true", help="Use vManage HTTP server (wget) instead of FTP for software download")
 
     return parser.parse_args()
 
@@ -94,10 +93,8 @@ def resolve_software_filename(target_manager):
 def confirm_iosxe_image_verification(output):
     text = str(output or "").lower()
     success_markers = [
-        "verification success",
-        "verify-image successful",
-        "verified successfully",
-        "verification completed",
+        "digital signature successfully verified",
+        "signature successfully verified",
     ]
     return any(marker in text for marker in success_markers)
 
@@ -105,12 +102,11 @@ def confirm_iosxe_image_verification(output):
 def confirm_iosxe_image_installation(output):
     text = str(output or "").lower()
     success_markers = [
-        "successfully installed ios xe version",
-        "install-image successful",
-        "install operation successful",
+        "success: install_add",
+        "image added. version",
         "found installed ios xe image",   # image already installed - treat as success
     ]
     success = any(marker in text for marker in success_markers)
     if not success:
-        print(f"[!] Detailed output: {output}")
+        tprint(f"[!] Detailed output: {output}")
     return success

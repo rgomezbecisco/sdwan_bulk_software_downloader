@@ -8,7 +8,7 @@ from utils.ssh_manager import sshManager
 from find_manager import run_find_manager
 from utils import tprint
 
-def run_verify_iosxe_image(target_manager, filename=None, custom_timeout=120, verbose=False, sshclient=None, reuse_session=False):
+def run_verify_iosxe_image(target_manager, filename=None, custom_timeout=600, verbose=False, sshclient=None, reuse_session=False):
 
     print("<< Verify IOS XE image - START >>")
 
@@ -19,7 +19,7 @@ def run_verify_iosxe_image(target_manager, filename=None, custom_timeout=120, ve
         print("<< Verify IOS XE image - END >>\n")
         return {"success": False, "output": "no image mapped for device model"}
 
-    verify_command = f"request software verify-image {filename}"
+    verify_command = f"verify bootflash:{filename}"
         
 
     sshclient = sshclient or sshManager(target_manager)

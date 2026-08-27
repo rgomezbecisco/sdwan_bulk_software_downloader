@@ -1,6 +1,6 @@
 # SD-WAN Bulk Software Downloader
 
-Standalone tool to bulk-download, verify, and install an IOS XE software image
+Standalone tool to bulk-push, verify, and install an IOS XE software image
 onto multiple Cisco SD-WAN cEdge (IOS XE) devices in parallel, via SSH through
 their managing vManage node.
 
@@ -11,14 +11,20 @@ against other SD-WAN customer environments.
 
 For each hostname listed in an input file, the tool:
 
-1. Looks up the device's managing vManage node via the vManage API.
-2. SSHes to that vManage node, jumps to the cEdge device, and fires a
-   background `wget` to pull the software image from the vManage HTTP
-   software server.
-3. Polls download progress until complete (with automatic resume on stalls).
-4. Runs `request software verify-image` and `request software install-image`
-   on the device.
-5. Confirms the new version is listed in `show software`.
+1. Looks up the device's managing vManage node via the vManage API, and the
+   image mapped to that device's model.
+2. SSHes to that vManage node and fires a detached `sshpass`/`scp` push of the
+   image into the device's `bootflash:vmanage-admin/` staging directory.
+3. Polls transfer progress from the device until the byte count matches the
+   expected image size (restarting the transfer if it stalls — scp cannot
+   resume, so a retry starts from zero).
+4. Copies the image from the staging directory to the `bootflash:` root.
+5. Runs `verify bootflash:<image>` and
+   `request platform software sdwan software install bootflash:<image>`.
+6. Confirms the new version is listed in `show sdwan software`, then deletes
+   the staging copy.
+
+The install only *adds* the image — it does not activate or reboot.
 
 Progress for all sites is shown live in a terminal table (via `rich`).
 
@@ -27,6 +33,7 @@ Progress for all sites is shown live in a terminal table (via `rich`).
 - Python 3.9+
 - Network/SSH reachability from this machine to the customer's vManage nodes
 - A vManage API user with read access to device inventory
+- `sshpass` available on the vManage (used for the non-interactive scp push)
 - SSH admin credentials for the cEdge devices (or a shared admin password)
 
 Install dependencies:
@@ -115,7 +122,7 @@ Options:
 --file, -f       Text file with one hostname per line (required, unless --diagnose)
 --interval, -i   Poll interval in seconds (default: 60)
 --workers, -w    Max parallel SSH workers (default: 20)
---cleanup, -c    Remove stale download file(s)/wget logs before firing downloads
+--cleanup, -c    Delete any partial/stale staged image on the edge before pushing
 --diagnose, -d   With a hostname: walk each SSH hop and print raw output.
                  Bare, with --file: read-only fleet pre-flight over the API
 ```
@@ -142,7 +149,7 @@ core/
     testbed_cedge.j2             pyATS testbed template for cEdge (IOS XE) proxy hop
   utils/
     api_manager.py                vManage API session/device lookup (catalystwan)
-    ssh_manager.py                 SSH/pyATS session handling, wget fire/poll, install/verify calls
+    ssh_manager.py                 SSH/pyATS session handling, scp push/poll, install/verify calls
     additional_functions.py        small shared helpers (arg parsing, yaml/json helpers, manager map lookup)
 ```
 
